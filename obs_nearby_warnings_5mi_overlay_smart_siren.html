@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OBS Nearby Warning Overlay (Smart Refresh + Tornado Siren)</title>
+
+<link rel="preconnect" href="https://api.weather.gov">
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.overlay {
+  position: absolute;
+  left: 24px;
+  top: 24px;
+  width: 360px;
+  min-height: 78px;
+  color: #fff;
+  background: rgba(10, 15, 24, 0.86);
+  border-radius: 16px;
+  box-shadow: 0 14px 30px rgba(0,0,0,0.35);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 10px 14px;
+  background: rgba(255,255,255,0.05);
+}
+
+.title {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.range {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  opacity: 0.88;
+}
+
+.body {
+  padding: 12px 14px 14px 14px;
+}
+
+.status {
+  font-size: 14px;
+  line-height: 1.35;
+  color: rgba(255,255,255,0.92);
+}
+
+.status.subtle {
+  color: rgba(255,255,255,0.78);
+}
+
+.alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.alert {
+  background: rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 10px 11px;
+}
+
+.alert.tornado {
+  background: rgba(180, 20, 20, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(255,90,90,0.28);
+}
+
+.alert-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+
+.event {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.distance {
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  opacity: 0.95;
+}
+
+.meta {
+  font-size: 12px;
+  line-height: 1.35;
+  color: rgba(255,255,255,0.82);
+}
+
+.footer {
+  margin-top: 8px;
+  font-size: 10px;
+  color: rgba(255,255,255,0.58);
+}
+
+.hidden {
+  display: none;
+}
+</style>
+</head>
+<body>
+  <div class="overlay">
+    <div class="header">
+      <div class="title">Nearby Warnings</div>
+      <div class="range">Within 5 miles</div>
+    </div>
+    <div class="body">
+      <div id="status" class="status subtle">Waiting for location…</div>
+      <div id="alerts" class="alert-list hidden"></div>
+      <div id="footer" class="footer">Checks NWS every 60 seconds. Display refreshes every 5 seconds.</div>
+    </div>
+  </div>
+
+<script>
+const WARNING_TYPES = new Set([
+  "Severe Thunderstorm Warning",
+  "Tornado Warning",
+  "Flash Flood Warning",
+  "Special Marine Warning"
+]);
+
+const RADIUS_MILES = 5;
+const FETCH_MS = 60000;
+const DISPLAY_MS = 5000;
+
+let currentPosition = null;
+let fetchTimer = null;
+let displayTimer = null;
+let cachedAlerts = [];
+let lastFetchTime = null;
+let lastTornadoSignature = "";
+
+const statusEl = document.getElementById("status");
+const alertsEl = document.getElementById("alerts");
+const footerEl = document.getElementById("footer");
+
+function setStatus(text, subtle=true) {
+  statusEl.textContent = text;
+  statusEl.className = subtle ? "status subtle" : "status";
+}
+
+function esc(text) {
+  return String(text ?? "").replace(/[&<>"']/g, s => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[s]));
+}
+
+function formatDistance(mi) {
+  if (mi < 0.2) return "At your location";
+  if (mi < 1) return `${mi.toFixed(1)} mi away`;
+  return `${Math.round(mi * 10) / 10} mi away`;
+}
+
+function parseTime(t) {
+  if (!t) return "";
+  const d = new Date(t);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function ageText() {
+  if (!lastFetchTime) return "No NWS fetch yet";
+  const sec = Math.max(0, Math.round((Date.now() - lastFetchTime) / 1000));
+  return `Last NWS check ${sec}s ago`;
+}
+
+function renderFromCache() {
+  footerEl.textContent = `${ageText()} • Display refreshes every 5 seconds`;
+
+  if (!cachedAlerts.length) {
+    alertsEl.innerHTML = "";
+    alertsEl.classList.add("hidden");
+    setStatus("No severe thunderstorm, tornado, flash flood, or special marine warnings within 5 miles.", false);
+    return;
+  }
+
+  alertsEl.innerHTML = cachedAlerts.map(a => {
+    const when = a.expires ? `Until ${parseTime(a.expires)}` : "";
+    const area = a.areaDesc ? esc(a.areaDesc) : "";
+    const css = a.event === "Tornado Warning" ? "alert tornado" : "alert";
+    return `
+      <div class="${css}">
+        <div class="alert-top">
+          <div class="event">${esc(a.event)}</div>
+          <div class="distance">${esc(formatDistance(a.distanceMiles))}</div>
+        </div>
+        <div class="meta">${when}${when && area ? " • " : ""}${area}</div>
+      </div>
+    `;
+  }).join("");
+
+  alertsEl.classList.remove("hidden");
+  setStatus(`${cachedAlerts.length} nearby warning${cachedAlerts.length === 1 ? "" : "s"} found.`, false);
+}
+
+function getMinimumDistanceMiles(point, geometry) {
+  try {
+    if (!geometry) return Infinity;
+    const pointFeature = turf.point(point);
+
+    if (geometry.type === "Polygon" || geometry.type === "MultiPolygon") {
+      const poly = turf.feature(geometry);
+
+      if (turf.booleanPointInPolygon(pointFeature, poly)) return 0;
+
+      const line = turf.polygonToLine(poly);
+      const nearest = turf.nearestPointOnLine(line, pointFeature, { units: "kilometers" });
+      const km = nearest?.properties?.dist;
+      if (typeof km === "number") return km / 1.609344;
+    }
+
+    return Infinity;
+  } catch {
+    return Infinity;
+  }
+}
+
+function tornadoSignature(alerts) {
+  return alerts
+    .filter(a => a.event === "Tornado Warning")
+    .map(a => [a.event, a.areaDesc || "", a.expires || "", Math.round(a.distanceMiles * 10) / 10].join("|"))
+    .sort()
+    .join("||");
+}
+
+function playSiren() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    const master = ctx.createGain();
+    master.gain.value = 0.05;
+    master.connect(ctx.destination);
+
+    for (let i = 0; i < 6; i++) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(650, now + i * 0.45);
+      osc.frequency.linearRampToValueAtTime(950, now + i * 0.45 + 0.22);
+      osc.frequency.linearRampToValueAtTime(650, now + i * 0.45 + 0.45);
+      gain.gain.setValueAtTime(0.0001, now + i * 0.45);
+      gain.gain.linearRampToValueAtTime(0.65, now + i * 0.45 + 0.03);
+      gain.gain.linearRampToValueAtTime(0.0001, now + i * 0.45 + 0.45);
+      osc.connect(gain);
+      gain.connect(master);
+      osc.start(now + i * 0.45);
+      osc.stop(now + i * 0.45 + 0.45);
+    }
+  } catch (e) {
+    console.log("Siren audio blocked or unavailable.", e);
+  }
+}
+
+async function fetchAlertsForPoint(lat, lon) {
+  const url = "https://api.weather.gov/alerts/active?status=actual&message_type=alert";
+  const res = await fetch(url, {
+    headers: { "Accept": "application/geo+json, application/json" },
+    cache: "no-store"
+  });
+
+  if (!res.ok) throw new Error(`Alert fetch failed (${res.status})`);
+
+  const data = await res.json();
+  const features = Array.isArray(data.features) ? data.features : [];
+  const point = [lon, lat];
+  const nearby = [];
+
+  for (const feature of features) {
+    const props = feature.properties || {};
+    const event = props.event || "";
+    if (!WARNING_TYPES.has(event)) continue;
+    if (!feature.geometry) continue;
+
+    const distanceMiles = getMinimumDistanceMiles(point, feature.geometry);
+    if (distanceMiles <= RADIUS_MILES) {
+      nearby.push({
+        event,
+        distanceMiles,
+        areaDesc: props.areaDesc || "",
+        expires: props.expires || "",
+      });
+    }
+  }
+
+  nearby.sort((a, b) => a.distanceMiles - b.distanceMiles);
+  return nearby;
+}
+
+async function refreshAlertsFromNWS() {
+  if (!currentPosition) return;
+
+  const { latitude, longitude } = currentPosition.coords;
+  setStatus("Checking active warnings nearby…", true);
+
+  try {
+    const newAlerts = await fetchAlertsForPoint(latitude, longitude);
+    const newSig = tornadoSignature(newAlerts);
+
+    if (newSig && newSig !== lastTornadoSignature) {
+      playSiren();
+    }
+
+    lastTornadoSignature = newSig;
+    cachedAlerts = newAlerts;
+    lastFetchTime = Date.now();
+    renderFromCache();
+  } catch (e) {
+    console.log(e);
+    setStatus("Could not load NWS alerts right now.", false);
+  }
+}
+
+function startTimers() {
+  if (!displayTimer) {
+    renderFromCache();
+    displayTimer = setInterval(renderFromCache, DISPLAY_MS);
+  }
+  if (!fetchTimer) {
+    refreshAlertsFromNWS();
+    fetchTimer = setInterval(refreshAlertsFromNWS, FETCH_MS);
+  }
+}
+
+if ("geolocation" in navigator) {
+  navigator.geolocation.watchPosition(
+    (pos) => {
+      currentPosition = pos;
+      startTimers();
+    },
+    (err) => {
+      console.log("Geolocation error:", err.code, err.message);
+      setStatus("Location unavailable in this browser source.", false);
+    },
+    {
+      enableHighAccuracy: true,
+      maximumAge: 5000,
+      timeout: 10000
+    }
+  );
+} else {
+  setStatus("Geolocation API not available.", false);
+}
+</script>
+</body>
+</html>
